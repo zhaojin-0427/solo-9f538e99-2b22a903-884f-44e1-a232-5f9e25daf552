@@ -1,13 +1,26 @@
-"""FastAPI 入口：流域网格发布与观测点批量查询。"""
+"""FastAPI 入口：流域网格发布、观测点批量查询与积水站淹没分析。"""
 from __future__ import annotations
 
+import math
+
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, RedirectResponse
 
 from .config import settings
-from .db import Database, VersionConflict, VersionNotFound
-from .geometry import GeometryError, classify_point, parse_surface, validate_submission
+from .db import Database, VersionConflict
+from .geometry import (
+    FloodComputationError,
+    GeometryError,
+    classify_point,
+    compute_flood,
+    parse_surface,
+    validate_flood_stations,
+    validate_submission,
+)
 from .schemas import (
+    FloodRequest,
+    FloodResponse,
     PointResult,
     PublishRequest,
     PublishResponse,
@@ -20,9 +33,10 @@ app = FastAPI(
     title="流域防汛网格服务",
     description=(
         "提交流域多边形与整版网格（互不重叠且恰好覆盖流域），按所见版号乐观锁发布；"
-        "观测点按固定版号批量落格，旧版持久保留可查。"
+        "观测点按固定版号批量落格，旧版持久保留可查；"
+        "积水站读数按全流域最近站代表区转换为逐格淹没范围。"
     ),
-    version="1.0.0",
+    version="1.1.0",
 )
 
 db = Database(settings.database_path)
@@ -38,6 +52,31 @@ def _error(status: int, error: str, detail: str, issues: list | None = None) -> 
 @app.exception_handler(GeometryError)
 async def geometry_error_handler(_: Request, exc: GeometryError) -> JSONResponse:
     return _error(422, "INVALID_GEOMETRY", str(exc))
+
+
+@app.exception_handler(FloodComputationError)
+async def flood_error_handler(_: Request, exc: FloodComputationError) -> JSONResponse:
+    # 计算失败整次拒绝，不返回任何部分结果
+    return _error(500, "FLOOD_COMPUTATION_FAILED", str(exc))
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(_: Request, exc: RequestValidationError) -> JSONResponse:
+    # 默认错误体会回显输入；NaN/Infinity 不是合法 JSON token，需净化后再返回
+    issues = []
+    for err in exc.errors():
+        clean = {
+            "loc": list(err.get("loc", [])),
+            "type": err.get("type"),
+            "msg": err.get("msg"),
+        }
+        value = err.get("input")
+        if isinstance(value, float) and not math.isfinite(value):
+            clean["input"] = "non_finite_float"
+        elif isinstance(value, (str, int, bool)) or value is None:
+            clean["input"] = value
+        issues.append(clean)
+    return _error(422, "REQUEST_VALIDATION_FAILED", "请求参数校验失败，整次拒绝", issues)
 
 
 @app.get("/", include_in_schema=False)
@@ -148,3 +187,54 @@ async def query(req: QueryRequest) -> JSONResponse | QueryResponse:
         )
 
     return QueryResponse(version=version, is_current=(version == current), results=results)
+
+
+@app.post(
+    "/flood",
+    response_model=FloodResponse,
+    tags=["淹没分析"],
+    responses={
+        404: {"model": dict, "description": "指定版本不存在或尚无已发布版本"},
+        422: {"model": dict, "description": "站点语义校验失败（编号/坐标重复、站点不在流域内部等），整次拒绝"},
+        500: {"model": dict, "description": "几何计算失败，整次拒绝且不返回部分结果"},
+    },
+)
+async def flood(req: FloodRequest) -> JSONResponse | FloodResponse:
+    # 1) 版号解析：省略时固定受理时当前版；版号与快照几何来自同一版本行，改版不会错配
+    current = db.current_version()
+    if req.version is None:
+        if current is None:
+            return _error(404, "NO_PUBLISHED_VERSION", "尚无已发布版本，请先调用 /publish")
+        version = current
+    else:
+        version = req.version
+        if not any(v["version"] == version for v in db.list_versions()):
+            return _error(404, "VERSION_NOT_FOUND", f"版本 {version} 不存在")
+
+    watershed, grids = db.load_snapshot(version)
+
+    # 2) 语义校验：站号唯一、坐标唯一、站点严格位于流域内部；任何问题整次拒绝
+    issues = validate_flood_stations(req.stations, watershed)
+    if issues:
+        return _error(
+            422,
+            "FLOOD_INPUT_INVALID",
+            "淹没请求输入无效，整次拒绝（问题见 issues）",
+            issues,
+        )
+
+    # 3) 最近站代表区 + 逐格裁切；计算失败由异常处理器整次拒绝
+    area_tol = max(watershed.area * settings.area_tol_rel, 0.0)
+    flooded_ids, grid_results = compute_flood(
+        watershed, grids, req.stations, req.threshold, area_tol
+    )
+    # 网格按编号稳定排序，保证相同输入逐字节可复现（指定旧版重算一致）
+    grid_results.sort(key=lambda g: g["grid_id"])
+
+    return FloodResponse(
+        version=version,
+        is_current=(version == current),
+        threshold=req.threshold,
+        flooded_station_ids=flooded_ids,
+        grids=grid_results,
+    )

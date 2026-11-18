@@ -1,0 +1,10 @@
+{
+  "version": null,
+  "threshold": 0.3,
+  "stations": [
+    {"station_id": "ST-001", "lon": 1.0, "lat": 1.0, "depth": 0.52},
+    {"station_id": "ST-002", "lon": 3.0, "lat": 1.0, "depth": 0.18},
+    {"station_id": "ST-003", "lon": 1.0, "lat": 3.0, "depth": 0.0},
+    {"station_id": "ST-004", "lon": 3.0, "lat": 3.0, "depth": 0.81}
+  ]
+}
